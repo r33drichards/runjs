@@ -14,8 +14,68 @@ use std::sync::OnceLock;
 
 use deno_ast::ParseParams;
 
+/// Configuration for the RunJS runtime
+#[derive(Debug, Clone)]
+pub struct RunJsConfig {
+    /// The root path for chroot operations. If None, chroot is disabled.
+    pub chroot_path: Option<PathBuf>,
+}
+
+impl Default for RunJsConfig {
+    fn default() -> Self {
+        Self {
+            chroot_path: None,
+        }
+    }
+}
+
+/// The main RunJS runtime instance
+pub struct RunJs {
+    config: RunJsConfig,
+}
+
+impl RunJs {
+    /// Create a new RunJS instance with the given configuration
+    pub fn new(config: RunJsConfig) -> Self {
+        Self { config }
+    }
+
+    /// Create a new RunJS instance with default configuration (no chroot)
+    pub fn new_default() -> Self {
+        Self::new(RunJsConfig::default())
+    }
+
+    /// Run a JavaScript/TypeScript file
+    pub async fn run_file(&self, file_path: &str) -> Result<(), CoreError> {
+        let main_module = deno_core::resolve_path(file_path, std::env::current_dir()?.as_path())
+            .map_err(JsErrorBox::from_err)?;
+
+        let mut js_runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
+            module_loader: Some(Rc::new(TsModuleLoader)),
+            extensions: vec![runjs::init()],
+            ..Default::default()
+        });
+
+        // Set up chroot if configured
+        if let Some(chroot_path) = &self.config.chroot_path {
+            let chroot_path = chroot_path.canonicalize().map_err(|e| {
+                CoreError::from(JsErrorBox::type_error(format!(
+                    "Failed to canonicalize chroot path: {}",
+                    e
+                )))
+            })?;
+            CHROOT_CONFIG.set(ChrootConfig::new(chroot_path)).unwrap();
+        }
+
+        let mod_id = js_runtime.load_main_es_module(&main_module).await?;
+        let result = js_runtime.mod_evaluate(mod_id);
+        js_runtime.run_event_loop(Default::default()).await?;
+        result.await
+    }
+}
+
 // Global chroot configuration
-static CHROOT_CONFIG: OnceLock<ChrootConfig> = OnceLock::new();
+static CHROOT_CONFIG: std::sync::OnceLock<ChrootConfig> = std::sync::OnceLock::new();
 
 #[derive(Debug)]
 struct ChrootConfig {
@@ -40,12 +100,6 @@ impl ChrootConfig {
         
         Ok(normalized)
     }
-}
-
-fn init_chroot(root_path: &str) -> Result<(), std::io::Error> {
-    let root_path = Path::new(root_path).canonicalize()?;
-    CHROOT_CONFIG.set(ChrootConfig::new(root_path)).unwrap();
-    Ok(())
 }
 
 #[op2(async)]
@@ -201,46 +255,26 @@ extension!(
   esm = [dir "src", "runtime.js"],
 );
 
-async fn run_js(file_path: &str) -> Result<(), CoreError> {
-  let main_module =
-    deno_core::resolve_path(file_path, env::current_dir()?.as_path())
-      .map_err(JsErrorBox::from_err)?;
-  let mut js_runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-    module_loader: Some(Rc::new(TsModuleLoader)),
-
-    // startup_snapshot: Some(RUNTIME_SNAPSHOT),
-    extensions: vec![runjs::init()],
-
-    ..Default::default()
-  });
-
-  let mod_id = js_runtime.load_main_es_module(&main_module).await?;
-  let result = js_runtime.mod_evaluate(mod_id);
-  js_runtime.run_event_loop(Default::default()).await?;
-  result.await
-}
-
 fn main() {
-  let args = &env::args().collect::<Vec<String>>()[1..];
+    let args = &env::args().collect::<Vec<String>>()[1..];
 
-  if args.is_empty() {
-    eprintln!("Usage: runjs <file>");
-    std::process::exit(1);
-  }
+    if args.is_empty() {
+        eprintln!("Usage: runjs <file>");
+        std::process::exit(1);
+    }
 
-  // Initialize chroot to current directory
-  if let Err(error) = init_chroot(".") {
-    eprintln!("Failed to initialize chroot: {error}");
-    std::process::exit(1);
-  }
+    let config = RunJsConfig {
+        chroot_path: Some(PathBuf::from(".")),
+    };
+    let runjs = RunJs::new(config);
 
-  let file_path = &args[0];
+    let file_path = &args[0];
 
-  let runtime = tokio::runtime::Builder::new_current_thread()
-    .enable_all()
-    .build()
-    .unwrap();
-  if let Err(error) = runtime.block_on(run_js(file_path)) {
-    eprintln!("error: {error}");
-  }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    if let Err(error) = runtime.block_on(runjs.run_file(file_path)) {
+        eprintln!("error: {error}");
+    }
 }
