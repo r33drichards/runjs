@@ -9,6 +9,8 @@ use deno_error::JsErrorBox;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use deno_ast::ParseParams;
+use std::cell::RefCell;
+use std::thread_local;
 
 /// Configuration for the RunJS runtime
 #[derive(Debug, Clone)]
@@ -28,12 +30,20 @@ impl Default for RunJsConfig {
 /// The main RunJS runtime instance
 pub struct RunJs {
     config: RunJsConfig,
+    chroot_config: Option<ChrootConfig>,
+}
+
+thread_local! {
+    static CURRENT_RUNJS: RefCell<Option<RunJs>> = RefCell::new(None);
 }
 
 impl RunJs {
     /// Create a new RunJS instance with the given configuration
     pub fn new(config: RunJsConfig) -> Self {
-        Self { config }
+        Self { 
+            config,
+            chroot_config: None,
+        }
     }
 
     /// Create a new RunJS instance with default configuration (no chroot)
@@ -42,11 +52,8 @@ impl RunJs {
     }
 
     /// Run a JavaScript/TypeScript file
-    pub async fn run_file(&self, file_path: &str) -> Result<(), CoreError> {
-        let main_module = deno_core::resolve_path(file_path, std::env::current_dir()?.as_path())
-            .map_err(JsErrorBox::from_err)?;
-
-        // Set up chroot if configured
+    pub async fn run_file(&mut self, file_path: &str) -> Result<(), CoreError> {
+        // First validate the path if chroot is enabled
         if let Some(chroot_path) = &self.config.chroot_path {
             let chroot_path = chroot_path.canonicalize().map_err(|e| {
                 CoreError::from(JsErrorBox::type_error(format!(
@@ -55,13 +62,25 @@ impl RunJs {
                 )))
             })?;
             
-            // Set new chroot config, replacing any existing one
-            if CHROOT_CONFIG.set(ChrootConfig::new(chroot_path)).is_err() {
-                return Err(CoreError::from(JsErrorBox::type_error(
-                    "Failed to set chroot configuration"
-                )));
+            // Create a temporary ChrootConfig to validate the path
+            let config = ChrootConfig::new(chroot_path.clone());
+            if let Err(e) = config.validate_path(file_path) {
+                return Err(CoreError::from(JsErrorBox::type_error(format!(
+                    "File path not allowed in chroot: {}",
+                    e
+                ))));
             }
+            
+            self.chroot_config = Some(config);
         }
+
+        let main_module = deno_core::resolve_path(file_path, std::env::current_dir()?.as_path())
+            .map_err(JsErrorBox::from_err)?;
+
+        // Store self in thread local storage
+        CURRENT_RUNJS.with(|runjs| {
+            *runjs.borrow_mut() = Some(self.clone());
+        });
 
         let mut js_runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
             module_loader: Some(Rc::new(TsModuleLoader)),
@@ -76,10 +95,17 @@ impl RunJs {
     }
 }
 
-// Global chroot configuration
-static CHROOT_CONFIG: std::sync::OnceLock<ChrootConfig> = std::sync::OnceLock::new();
+// Make RunJs cloneable
+impl Clone for RunJs {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            chroot_config: self.chroot_config.clone(),
+        }
+    }
+}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ChrootConfig {
     root_path: PathBuf,
 }
@@ -90,17 +116,36 @@ impl ChrootConfig {
     }
 
     fn validate_path(&self, path: &str) -> Result<PathBuf, std::io::Error> {
+        // First normalize the input path
         let path = Path::new(path);
-        let normalized = self.root_path.join(path).canonicalize()?;
-        
-        if !normalized.starts_with(&self.root_path) {
+        let normalized = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root_path.join(path)
+        };
+
+        // For new files, validate the parent directory is within chroot
+        if !normalized.exists() {
+            if let Some(parent) = normalized.parent() {
+                if !parent.starts_with(&self.root_path) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Path escapes chroot directory",
+                    ));
+                }
+            }
+            return Ok(normalized);
+        }
+
+        // For existing files, canonicalize and validate
+        let canonical = normalized.canonicalize()?;
+        if !canonical.starts_with(&self.root_path) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "Path escapes chroot directory",
             ));
         }
-        
-        Ok(normalized)
+        Ok(canonical)
     }
 }
 
@@ -109,15 +154,19 @@ impl ChrootConfig {
 async fn op_read_file(
     #[string] path: String,
 ) -> Result<String, std::io::Error> {
-    let config = CHROOT_CONFIG.get().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Chroot not initialized",
-        )
+    let path = CURRENT_RUNJS.with(|runjs| {
+        let runjs = runjs.borrow();
+        let config = runjs.as_ref().and_then(|r| r.chroot_config.as_ref()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Chroot not initialized",
+            )
+        })?;
+        
+        config.validate_path(&path)
     })?;
     
-    let validated_path = config.validate_path(&path)?;
-    tokio::fs::read_to_string(validated_path).await
+    tokio::fs::read_to_string(path).await
 }
 
 #[op2(async)]
@@ -125,34 +174,50 @@ async fn op_write_file(
     #[string] path: String,
     #[string] contents: String,
 ) -> Result<(), std::io::Error> {
-    let config = CHROOT_CONFIG.get().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Chroot not initialized",
-        )
+    let (path, root_path) = CURRENT_RUNJS.with(|runjs| -> Result<(PathBuf, PathBuf), std::io::Error> {
+        let runjs = runjs.borrow();
+        let config = runjs.as_ref().and_then(|r| r.chroot_config.as_ref()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Chroot not initialized",
+            )
+        })?;
+        
+        let path = config.validate_path(&path)?;
+        Ok((path, config.root_path.clone()))
     })?;
     
-    let validated_path = config.validate_path(&path)?;
-    
-    // Ensure parent directory exists
-    if let Some(parent) = validated_path.parent() {
+    // Ensure parent directory exists and is within chroot
+    if let Some(parent) = path.parent() {
+        if !parent.starts_with(&root_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Parent directory escapes chroot",
+            ));
+        }
         tokio::fs::create_dir_all(parent).await?;
     }
     
-    tokio::fs::write(validated_path, contents).await
+    tokio::fs::write(path, contents).await
 }
 
 #[op2(fast)]
-fn op_remove_file(#[string] path: String) -> Result<(), std::io::Error> {
-    let config = CHROOT_CONFIG.get().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Chroot not initialized",
-        )
+fn op_remove_file(
+    #[string] path: String,
+) -> Result<(), std::io::Error> {
+    let path = CURRENT_RUNJS.with(|runjs| {
+        let runjs = runjs.borrow();
+        let config = runjs.as_ref().and_then(|r| r.chroot_config.as_ref()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Chroot not initialized",
+            )
+        })?;
+        
+        config.validate_path(&path)
     })?;
     
-    let validated_path = config.validate_path(&path)?;
-    std::fs::remove_file(validated_path)
+    std::fs::remove_file(path)
 }
 
 #[op2(async)]
@@ -194,6 +259,22 @@ impl deno_core::ModuleLoader for TsModuleLoader {
 
         let module_load = move || {
             let path = module_specifier.to_file_path().unwrap();
+            
+            // Validate path against chroot if enabled
+            if let Some(config) = CURRENT_RUNJS.with(|runjs| {
+                runjs.borrow()
+                    .as_ref()
+                    .and_then(|r| r.chroot_config.as_ref())
+                    .cloned()
+            }) {
+                if let Err(e) = config.validate_path(path.to_str().unwrap()) {
+                    return Err(ModuleLoaderError::from(JsErrorBox::type_error(format!(
+                        "Module path not allowed in chroot: {}",
+                        e
+                    ))));
+                }
+            }
+
             let media_type = MediaType::from_path(&path);
 
             let (module_type, should_transpile) = match MediaType::from_path(&path) {
@@ -286,7 +367,7 @@ mod tests {
     async fn test_run_js_without_chroot() -> Result<()> {
         let (_temp_dir, test_file) = setup_test_env().await?;
         
-        let runjs = RunJs::new_default();
+        let mut runjs = RunJs::new_default();
         runjs.run_file(test_file.to_str().unwrap()).await?;
         
         Ok(())
@@ -299,7 +380,7 @@ mod tests {
         let config = RunJsConfig {
             chroot_path: Some(temp_dir.path().to_path_buf()),
         };
-        let runjs = RunJs::new(config);
+        let mut runjs = RunJs::new(config);
         
         // Should work with file inside chroot
         runjs.run_file(test_file.to_str().unwrap()).await?;
@@ -309,7 +390,10 @@ mod tests {
         fs::write(&outside_file, "console.log('Outside!');")?;
         
         let result = runjs.run_file(outside_file.to_str().unwrap()).await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "Expected error when accessing file outside chroot");
+        
+        // Clean up the outside file
+        fs::remove_file(outside_file)?;
         
         Ok(())
     }
@@ -321,14 +405,14 @@ mod tests {
         let config = RunJsConfig {
             chroot_path: Some(temp_dir.path().to_path_buf()),
         };
-        let runjs = RunJs::new(config);
+        let mut runjs = RunJs::new(config);
         
         // Create a test file that uses file operations
         let test_file = temp_dir.path().join("file_ops.js");
         fs::write(
             &test_file,
             r#"
-            const testFile = './test.txt';
+            const testFile = 'test.txt';  // Use relative path
             const content = 'Hello, World!';
             
             // Write file
@@ -355,7 +439,7 @@ mod tests {
     async fn test_fetch() -> Result<()> {
         let (temp_dir, _) = setup_test_env().await?;
         
-        let runjs = RunJs::new_default();
+        let mut runjs = RunJs::new_default();
         
         // Create a test file that uses fetch
         let test_file = temp_dir.path().join("fetch_test.js");
