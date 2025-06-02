@@ -51,6 +51,49 @@ impl RunJs {
         Self::new(RunJsConfig::default())
     }
 
+    // Run a Javascript/Typescript string 
+    pub async fn run_string(&mut self, code: &str) -> Result<(), CoreError> {
+        // Initialize chroot if enabled
+        if let Some(chroot_path) = &self.config.chroot_path {
+            let chroot_path = chroot_path.canonicalize().map_err(|e| {
+                CoreError::from(JsErrorBox::type_error(format!(
+                    "Failed to canonicalize chroot path: {}",
+                    e
+                )))
+            })?;
+            
+            // Create a ChrootConfig for validation
+            let config = ChrootConfig::new(chroot_path.clone());
+            self.chroot_config = Some(config);
+        }
+
+        // Store self in thread local storage
+        CURRENT_RUNJS.with(|runjs| {
+            *runjs.borrow_mut() = Some(self.clone());
+        });
+
+        // Create a virtual module specifier for the string code
+        let specifier = deno_core::resolve_url("data:text/javascript,code.js")
+            .map_err(JsErrorBox::from_err)?;
+
+        let module_loader = Rc::new(StringModuleLoader {
+            code: code.to_string(),
+            specifier: specifier.clone(),
+        });
+
+        let mut js_runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
+            module_loader: Some(module_loader),
+            extensions: vec![runjs::init()],
+            ..Default::default()
+        });
+
+        // Load the module
+        let mod_id = js_runtime.load_main_es_module(&specifier).await?;
+        let result = js_runtime.mod_evaluate(mod_id);
+        js_runtime.run_event_loop(Default::default()).await?;
+        result.await
+    }
+
     /// Run a JavaScript/TypeScript file
     pub async fn run_file(&mut self, file_path: &str) -> Result<(), CoreError> {
         // First validate the path if chroot is enabled
@@ -331,6 +374,48 @@ impl deno_core::ModuleLoader for TsModuleLoader {
     }
 }
 
+struct StringModuleLoader {
+    code: String,
+    specifier: deno_core::ModuleSpecifier,
+}
+
+impl deno_core::ModuleLoader for StringModuleLoader {
+    fn resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        _kind: deno_core::ResolutionKind,
+    ) -> Result<deno_core::ModuleSpecifier, ModuleLoaderError> {
+        if specifier == self.specifier.as_str() {
+            Ok(self.specifier.clone())
+        } else {
+            deno_core::resolve_import(specifier, referrer).map_err(Into::into)
+        }
+    }
+
+    fn load(
+        &self,
+        module_specifier: &deno_core::ModuleSpecifier,
+        _maybe_referrer: Option<&reqwest::Url>,
+        _is_dyn_import: bool,
+        _requested_module_type: deno_core::RequestedModuleType,
+    ) -> ModuleLoadResponse {
+        if module_specifier == &self.specifier {
+            let module = deno_core::ModuleSource::new(
+                deno_core::ModuleType::JavaScript,
+                deno_core::ModuleSourceCode::String(self.code.clone().into()),
+                &self.specifier,
+                None,
+            );
+            ModuleLoadResponse::Sync(Ok(module))
+        } else {
+            ModuleLoadResponse::Sync(Err(ModuleLoaderError::from(JsErrorBox::type_error(
+                "Only the main module is supported for string execution",
+            ))))
+        }
+    }
+}
+
 extension!(
     runjs,
     ops = [
@@ -452,6 +537,109 @@ mod tests {
         )?;
         
         runjs.run_file(test_file.to_str().unwrap()).await?;
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_string_basic() -> Result<()> {
+        let mut runjs = RunJs::new_default();
+        
+        // Test basic console.log
+        runjs.run_string("console.log('Hello from string!');").await?;
+        
+        // Test variable declaration and usage
+        runjs.run_string(
+            r#"
+            const x = 42;
+            console.log(x * 2);
+            "#,
+        ).await?;
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_string_with_runtime_features() -> Result<()> {
+        let mut runjs = RunJs::new_default();
+        
+        // Test setTimeout
+        runjs.run_string(
+            r#"
+            console.log('Start');
+            await setTimeout(100);
+            console.log('After timeout');
+            "#,
+        ).await?;
+        
+        // Test fetch
+        runjs.run_string(
+            r#"
+            const response = await runjs.fetch('https://httpbin.org/get');
+            console.log(response);
+            "#,
+        ).await?;
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_string_with_file_operations() -> Result<()> {
+        let (temp_dir, _) = setup_test_env().await?;
+        
+        let config = RunJsConfig {
+            chroot_path: Some(temp_dir.path().to_path_buf()),
+        };
+        let mut runjs = RunJs::new(config);
+        
+        // Test file operations within chroot
+        runjs.run_string(
+            r#"
+            const testFile = 'test.txt';
+            const content = 'Hello from string!';
+            
+            // Write file
+            await runjs.writeFile(testFile, content);
+            
+            // Read file
+            const readContent = await runjs.readFile(testFile);
+            console.log(readContent);
+            
+            // Remove file
+            await runjs.removeFile(testFile);
+            "#,
+        ).await?;
+        
+        // Verify file was removed
+        assert!(!temp_dir.path().join("test.txt").exists());
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_string_error_handling() -> Result<()> {
+        let mut runjs = RunJs::new_default();
+        
+        // Test syntax error
+        let result = runjs.run_string("this is not valid javascript;").await;
+        assert!(result.is_err(), "Expected error for invalid JavaScript");
+        
+        // Test runtime error
+        let result = runjs.run_string("throw new Error('Test error');").await;
+        assert!(result.is_err(), "Expected error for thrown error");
+        
+        // Test chroot violation
+        let config = RunJsConfig {
+            chroot_path: Some(PathBuf::from("/tmp")),
+        };
+        let mut runjs = RunJs::new(config);
+        
+        let result = runjs.run_string(
+            r#"
+            await runjs.writeFile('/etc/test.txt', 'should fail');
+            "#,
+        ).await;
+        assert!(result.is_err(), "Expected error for chroot violation");
         
         Ok(())
     }
