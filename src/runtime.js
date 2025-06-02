@@ -6,10 +6,10 @@ function argsToMessage(...args) {
 
 globalThis.console = {
   log: (...args) => {
-    core.print(`[out]: ${argsToMessage(...args)}\n`, false);
+    core.print(`${argsToMessage(...args)}\n`, false);
   },
   error: (...args) => {
-    core.print(`[err]: ${argsToMessage(...args)}\n`, true);
+    core.print(`${argsToMessage(...args)}\n`, true);
   },
 };
 

@@ -10,6 +10,9 @@ use deno_error::JsErrorBox;
 use std::env;
 use std::rc::Rc;
 
+use deno_ast::ParseParams;
+
+
 #[op2(async)]
 #[string]
 async fn op_read_file(
@@ -77,8 +80,9 @@ impl deno_core::ModuleLoader for TsModuleLoader {
 
     let module_load = move || {
       let path = module_specifier.to_file_path().unwrap();
+      let media_type = MediaType::from_path(&path);
 
-      let (module_type, _should_transpile) = match MediaType::from_path(&path) {
+      let (module_type, should_transpile) = match MediaType::from_path(&path) {
         MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
           (deno_core::ModuleType::JavaScript, false)
         }
@@ -95,6 +99,29 @@ impl deno_core::ModuleLoader for TsModuleLoader {
       };
 
       let code = std::fs::read_to_string(&path)?;
+
+      let code = if should_transpile {
+        let parsed = deno_ast::parse_module(ParseParams {
+          specifier: module_specifier.clone(),
+          text: code.into(),
+          media_type,
+          capture_tokens: false,
+          scope_analysis: false,
+          maybe_syntax: None,
+        })
+        .map_err(JsErrorBox::from_err)?;
+        parsed
+          .transpile(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+          )
+          .map_err(JsErrorBox::from_err)?
+          .into_source()
+          .text
+      } else {
+        code
+      };
 
       let module = deno_core::ModuleSource::new(
         module_type,
