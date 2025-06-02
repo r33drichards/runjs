@@ -13,18 +13,10 @@ use std::cell::RefCell;
 use std::thread_local;
 
 /// Configuration for the RunJS runtime
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunJsConfig {
     /// The root path for chroot operations. If None, chroot is disabled.
     pub chroot_path: Option<PathBuf>,
-}
-
-impl Default for RunJsConfig {
-    fn default() -> Self {
-        Self {
-            chroot_path: None,
-        }
-    }
 }
 
 /// The main RunJS runtime instance
@@ -34,7 +26,7 @@ pub struct RunJs {
 }
 
 thread_local! {
-    static CURRENT_RUNJS: RefCell<Option<RunJs>> = RefCell::new(None);
+    static CURRENT_RUNJS: RefCell<Option<RunJs>> = const { RefCell::new(None) };
 }
 
 impl RunJs {
