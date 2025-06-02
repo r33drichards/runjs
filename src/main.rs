@@ -1,8 +1,9 @@
 use runjs::RunJs;
-use std::env;
 use std::path::PathBuf;
+use std::{env, result};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = &env::args().collect::<Vec<String>>()[1..];
 
     if args.is_empty() {
@@ -10,18 +11,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    let config = runjs::RunJsConfig {
+    let result = RunJs::new(runjs::RunJsConfig {
         chroot_path: Some(PathBuf::from(".")),
-    };
-    let mut runjs = RunJs::new(config);
-
-    let file_path = &args[0];
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    if let Err(error) = runtime.block_on(runjs.run_file(file_path)) {
-        eprintln!("error: {error}");
-    }
+    })
+    .run_string("console.log('hello rust')")
+    .await;
 }

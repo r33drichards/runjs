@@ -4,6 +4,27 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-        
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug runjs",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=runjs",
+                    "--package=runjs"
+                ],
+                "filter": {
+                    "name": "runjs",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PATH": "/usr/local/bin:/usr/bin:/bin"
+            },
+            "sourceLanguages": ["rust"]
+        }
     ]
 }
