@@ -24,6 +24,7 @@ deno_core = "0.350.0"
 deno_error = "0.6.1"
 reqwest = "0.12.18"
 tokio = { version = "1.45.1", features = ["full"] }
+clap = { version = "4.5.1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3.10.1"

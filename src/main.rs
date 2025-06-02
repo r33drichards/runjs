@@ -1,19 +1,29 @@
+use clap::Parser;
 use runjs::RunJs;
 use std::path::PathBuf;
-use std::{env, result};
+
+/// A JavaScript/TypeScript runtime with chroot capabilities
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// The JavaScript/TypeScript file to run
+    #[arg(required = true)]
+    file: PathBuf,
+
+    /// Optional chroot path (defaults to current directory)
+    #[arg(long, short)]
+    chroot: Option<PathBuf>,
+}
+
 
 #[tokio::main]
 async fn main() {
-    let args = &env::args().collect::<Vec<String>>()[1..];
+    let cli = Cli::parse();
 
-    if args.is_empty() {
-        eprintln!("Usage: runjs <file>");
-        std::process::exit(1);
-    }
+    let runjs = RunJs::new(runjs::RunJsConfig {
+        chroot_path: cli.chroot.or_else(|| Some(PathBuf::from("."))),
+    });
 
-    let result = RunJs::new(runjs::RunJsConfig {
-        chroot_path: Some(PathBuf::from(".")),
-    })
-    .run_string("console.log('hello rust')")
-    .await;
+    
+
 }
