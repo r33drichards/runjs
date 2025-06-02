@@ -9,18 +9,59 @@ use deno_core::ModuleSourceCode;
 use deno_error::JsErrorBox;
 use std::env;
 use std::rc::Rc;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use deno_ast::ParseParams;
 
+// Global chroot configuration
+static CHROOT_CONFIG: OnceLock<ChrootConfig> = OnceLock::new();
+
+#[derive(Debug)]
+struct ChrootConfig {
+    root_path: PathBuf,
+}
+
+impl ChrootConfig {
+    fn new(root_path: PathBuf) -> Self {
+        Self { root_path }
+    }
+
+    fn validate_path(&self, path: &str) -> Result<PathBuf, std::io::Error> {
+        let path = Path::new(path);
+        let normalized = self.root_path.join(path).canonicalize()?;
+        
+        if !normalized.starts_with(&self.root_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Path escapes chroot directory",
+            ));
+        }
+        
+        Ok(normalized)
+    }
+}
+
+fn init_chroot(root_path: &str) -> Result<(), std::io::Error> {
+    let root_path = Path::new(root_path).canonicalize()?;
+    CHROOT_CONFIG.set(ChrootConfig::new(root_path)).unwrap();
+    Ok(())
+}
 
 #[op2(async)]
 #[string]
 async fn op_read_file(
   #[string] path: String,
 ) -> Result<String, std::io::Error> {
-  let out = tokio::fs::read_to_string(path).await;
-
-  out
+  let config = CHROOT_CONFIG.get().ok_or_else(|| {
+    std::io::Error::new(
+      std::io::ErrorKind::NotFound,
+      "Chroot not initialized",
+    )
+  })?;
+  
+  let validated_path = config.validate_path(&path)?;
+  tokio::fs::read_to_string(validated_path).await
 }
 
 #[op2(async)]
@@ -28,7 +69,15 @@ async fn op_write_file(
   #[string] path: String,
   #[string] contents: String,
 ) -> Result<(), std::io::Error> {
-  tokio::fs::write(path, contents).await
+  let config = CHROOT_CONFIG.get().ok_or_else(|| {
+    std::io::Error::new(
+      std::io::ErrorKind::NotFound,
+      "Chroot not initialized",
+    )
+  })?;
+  
+  let validated_path = config.validate_path(&path)?;
+  tokio::fs::write(validated_path, contents).await
 }
 
 #[op2(fast)]
@@ -158,7 +207,6 @@ async fn run_js(file_path: &str) -> Result<(), CoreError> {
       .map_err(JsErrorBox::from_err)?;
   let mut js_runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
     module_loader: Some(Rc::new(TsModuleLoader)),
-    // module_loader: Some(Rc::new(deno_core::FsModuleLoader)),
 
     // startup_snapshot: Some(RUNTIME_SNAPSHOT),
     extensions: vec![runjs::init()],
@@ -179,6 +227,13 @@ fn main() {
     eprintln!("Usage: runjs <file>");
     std::process::exit(1);
   }
+
+  // Initialize chroot to current directory
+  if let Err(error) = init_chroot(".") {
+    eprintln!("Failed to initialize chroot: {error}");
+    std::process::exit(1);
+  }
+
   let file_path = &args[0];
 
   let runtime = tokio::runtime::Builder::new_current_thread()
